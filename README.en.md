@@ -126,16 +126,26 @@ python3 tools/handoff.py doctor       # what the tool sees on this machine
 python3 tools/handoff.py status       # summary of the repository and the sessions
 ```
 
-**A planned agent switch**, when you're about to stop and hand off on purpose:
+**A planned agent switch**, when you're about to stop and hand off on
+purpose. The positional agent is the one you're *leaving* — the agent whose
+transcript gets read — never the destination. The next agent is named
+nowhere: it just reads a Markdown file.
 
 ```bash
 python3 tools/handoff.py snapshot claude --ai
 ```
 
-Then, in Codex:
+Then open the next agent **in the same checkout** (the handoff is a map, not
+a copy: it assumes the next agent shares the working tree and can run
+`git diff` itself) and give it:
 
-> Read AGENTS.md and HANDOFF.md and continue the current work. Inspect Git
-> and the code before making any change.
+> Read AGENTS.md and HANDOFF.md and continue the current work. Inspect
+> `git status` and `git diff` before making any change, and preserve
+> unfinished work from earlier sessions.
+
+When that agent stops in turn, the positional name follows it —
+`snapshot codex --ai` — and whoever comes next reads the updated `HANDOFF.md`
+the same way.
 
 **An emergency**, when the session died before you could ask for a summary:
 

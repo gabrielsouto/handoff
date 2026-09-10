@@ -127,16 +127,26 @@ python3 tools/handoff.py doctor       # o que a ferramenta enxerga nesta máquin
 python3 tools/handoff.py status       # resumo do repositório e das sessões
 ```
 
-**Troca planejada de agente**, quando você vai parar e entregar de propósito:
+**Troca planejada de agente**, quando você vai parar e entregar de propósito.
+O agente no comando é o que você está *deixando* — aquele cujo transcript vai
+ser lido —, nunca o destino. O próximo agente não é nomeado em lugar nenhum:
+ele só lê um arquivo Markdown.
 
 ```bash
 python3 tools/handoff.py snapshot claude --ai
 ```
 
-Depois, no Codex:
+Depois, abra o próximo agente **no mesmo checkout** (o handoff é um mapa, não
+uma cópia: ele pressupõe que o próximo agente está na mesma árvore de
+trabalho e pode rodar `git diff` sozinho) e passe a ele:
 
-> Leia AGENTS.md e HANDOFF.md e continue o trabalho atual. Inspecione o Git e
-> o código antes de fazer qualquer mudança.
+> Leia AGENTS.md e HANDOFF.md e continue o trabalho atual. Inspecione
+> `git status` e `git diff` antes de qualquer mudança e preserve o trabalho
+> não terminado das sessões anteriores.
+
+Quando esse agente parar, por sua vez, o nome no comando acompanha —
+`snapshot codex --ai` —, e quem vier depois lê o `HANDOFF.md` atualizado do
+mesmo jeito.
 
 **Emergência**, quando a sessão morreu e não deu tempo de pedir um resumo:
 
