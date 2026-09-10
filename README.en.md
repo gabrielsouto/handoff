@@ -65,6 +65,10 @@ handoff on its own, in seconds, entirely on your machine.
   with `--repo` or `$HANDOFF_REPO`; nothing needs to be installed per-repo.
 - **Streams; never loads a whole transcript into memory.** A real 112 MiB
   Codex session parses in ~2.4 s with a ~31 MiB peak Python heap.
+- **Agent memory is indexed, never ingested.** `HANDOFF.md` lists what exists
+  (Claude's memory directory, Codex's SQLite stores, `CLAUDE.md`/`GEMINI.md`)
+  and how fresh it is, but never reads the content — it's another agent's
+  past interpretation, not evidence.
 
 ## Supported agents
 
@@ -226,6 +230,10 @@ All of it stays local and out of Git via `.git/info/exclude`. `HANDOFF.md`
 never contains a full diff — the next agent shares the checkout and can run
 `git diff`; the handoff is a map, not a copy.
 
+An **Agent Memory** section is also always included, listing whatever agent
+memory the tool found (existence and freshness, never content) — see
+[docs/handoff.md](docs/handoff.md#10-agent-memory).
+
 ## The optional LLM
 
 By default there is no LLM integration at all, and nothing here opens a
@@ -264,7 +272,7 @@ python3 -m py_compile tools/handoff.py
 python3 -m unittest discover -s tests -t .
 ```
 
-141 tests, standard library only (`unittest` + a local `http.server` stub for
+156 tests, standard library only (`unittest` + a local `http.server` stub for
 the LLM client). Fixtures are synthetic, built from the record shapes
 actually observed in real transcripts — no real session is ever committed.
 

@@ -829,6 +829,57 @@ class TestGeminiAdapter(TempDirCase):
         other_path = self.tmp / ".gemini" / "tmp" / "unrelated" / "chats" / "session-x.jsonl"
         self.assertFalse(adapter.path_hint_matches(other_path))
 
+    def test_memory_scratchpad_is_surfaced_as_a_labeled_compaction_event(self):
+        path = self.tmp / "scratchpad.jsonl"
+        write_jsonl(path, [
+            gemini_header(),
+            {"id": "u1", "type": "user", "content": [{"text": "let's start"}]},
+            {"$set": {"memoryScratchpad": "Project uses FastAPI + Postgres."}},
+        ])
+        events = [e for e, ok in self.adapter.iter_events(path) if ok]
+        scratchpad_events = [e for e in events if e.tool_name == "memory-scratchpad"]
+        self.assertEqual(len(scratchpad_events), 1)
+        event = scratchpad_events[0]
+        self.assertEqual(event.kind, handoff.KIND_COMPACTION)
+        self.assertIn("fresh as of the most recent message", event.text)
+        self.assertIn("Project uses FastAPI + Postgres.", event.text)
+
+    def test_memory_scratchpad_is_marked_stale_after_a_later_message(self):
+        path = self.tmp / "scratchpad_stale.jsonl"
+        write_jsonl(path, [
+            gemini_header(),
+            {"$set": {"memoryScratchpad": "Saved early."}},
+            {"id": "u1", "type": "user", "content": [{"text": "conversation kept going"}]},
+        ])
+        events = [e for e, ok in self.adapter.iter_events(path) if ok]
+        event = next(e for e in events if e.tool_name == "memory-scratchpad")
+        self.assertIn("possibly stale", event.text)
+
+    def test_memory_scratchpad_is_marked_stale_after_a_rewind(self):
+        path = self.tmp / "scratchpad_rewind.jsonl"
+        write_jsonl(path, [
+            gemini_header(),
+            {"$set": {"memoryScratchpad": "Saved early."}},
+            {"$rewindTo": "does-not-exist"},
+        ])
+        events = [e for e, ok in self.adapter.iter_events(path) if ok]
+        event = next(e for e in events if e.tool_name == "memory-scratchpad")
+        self.assertIn("possibly stale", event.text)
+
+    def test_clearing_the_scratchpad_removes_the_event(self):
+        path = self.tmp / "scratchpad_cleared.jsonl"
+        write_jsonl(path, [
+            gemini_header(),
+            {"$set": {"memoryScratchpad": "Saved early."}},
+            {"$set": {"memoryScratchpad": ""}},
+        ])
+        events = [e for e, ok in self.adapter.iter_events(path) if ok]
+        self.assertFalse(any(e.tool_name == "memory-scratchpad" for e in events))
+
+    def test_no_scratchpad_means_no_event(self):
+        events = self.events()  # the shared fixture never sets memoryScratchpad
+        self.assertFalse(any(e.tool_name == "memory-scratchpad" for e in events))
+
 
 # --------------------------------------------------------------------------
 # Evidence building
@@ -1070,6 +1121,119 @@ class TestAgentsMd(TempDirCase):
 
 
 # --------------------------------------------------------------------------
+# Agent memory - indexed, never ingested
+# --------------------------------------------------------------------------
+
+
+class TestAgentMemory(TempDirCase):
+    def setUp(self):
+        super().setUp()
+        self.repo = self.tmp / "repo"
+        self.home = self.tmp / "home"
+        self.repo.mkdir()
+        self.home.mkdir()
+
+    def git_state(self, untracked=()):
+        return handoff.GitState(root=str(self.repo), untracked=list(untracked))
+
+    def test_nothing_found_returns_an_empty_list(self):
+        entries = handoff.describe_agent_memory(self.repo, self.git_state(), home=self.home)
+        self.assertEqual(entries, [])
+
+    def test_claude_memory_directory_is_found_via_the_slug_heuristic(self):
+        slug = handoff.ClaudeAdapter.slug_for(str(self.repo))
+        memory_dir = self.home / ".claude" / "projects" / slug / "memory"
+        memory_dir.mkdir(parents=True)
+        (memory_dir / "fact-one.md").write_text("x", encoding="utf-8")
+        (memory_dir / "MEMORY.md").write_text("- fact one", encoding="utf-8")
+
+        entries = handoff.describe_agent_memory(self.repo, self.git_state(), home=self.home)
+        claude_entries = [e for e in entries if e.agent == handoff.AGENT_CLAUDE
+                          and e.label == "Memory directory"]
+        self.assertEqual(len(claude_entries), 1)
+        self.assertIn("2 file(s)", claude_entries[0].detail)
+
+    def test_claude_memory_directory_reports_zero_files_when_empty(self):
+        slug = handoff.ClaudeAdapter.slug_for(str(self.repo))
+        (self.home / ".claude" / "projects" / slug / "memory").mkdir(parents=True)
+        entries = handoff.describe_agent_memory(self.repo, self.git_state(), home=self.home)
+        claude_entries = [e for e in entries if e.label == "Memory directory"]
+        self.assertEqual(claude_entries[0].detail, "0 file(s)")
+
+    def test_claude_md_reports_untracked_status(self):
+        (self.repo / "CLAUDE.md").write_text("# instructions", encoding="utf-8")
+
+        tracked_entries = handoff.describe_agent_memory(self.repo, self.git_state(), home=self.home)
+        tracked = next(e for e in tracked_entries if "CLAUDE.md" in e.label)
+        self.assertNotIn("untracked", tracked.detail)
+
+        untracked_entries = handoff.describe_agent_memory(
+            self.repo, self.git_state(untracked=["CLAUDE.md"]), home=self.home)
+        untracked = next(e for e in untracked_entries if "CLAUDE.md" in e.label)
+        self.assertIn("untracked", untracked.detail)
+
+    def test_gemini_md_is_indexed_the_same_way(self):
+        (self.repo / "GEMINI.md").write_text("# instructions", encoding="utf-8")
+        entries = handoff.describe_agent_memory(self.repo, self.git_state(), home=self.home)
+        entry = next(e for e in entries if e.agent == handoff.AGENT_GEMINI)
+        self.assertEqual(entry.label, "Project instructions (GEMINI.md)")
+
+    def test_codex_sqlite_files_are_indexed_by_presence_only_never_opened(self):
+        codex_dir = self.home / ".codex"
+        codex_dir.mkdir(parents=True)
+        # Deliberately not valid SQLite - proves the file is never opened/parsed.
+        (codex_dir / "memories_1.sqlite").write_bytes(b"not a real sqlite file")
+        (codex_dir / "goals_1.sqlite").write_bytes(b"also not sqlite")
+
+        entries = handoff.describe_agent_memory(self.repo, self.git_state(), home=self.home)
+        codex_entries = {e.label: e for e in entries if e.agent == handoff.AGENT_CODEX}
+        self.assertEqual(set(codex_entries), {"memories_1.sqlite", "goals_1.sqlite"})
+        for entry in codex_entries.values():
+            self.assertIn("not parsed", entry.detail)
+            self.assertIn("global", entry.detail)
+
+    def test_render_agent_memory_section_reports_none_found(self):
+        rendered = handoff.render_agent_memory_section([])
+        self.assertIn("## Agent Memory", rendered)
+        self.assertIn("No agent memory found", rendered)
+
+    def test_render_agent_memory_section_lists_every_entry(self):
+        entries = [
+            handoff.MemoryEntry(handoff.AGENT_CLAUDE, "Memory directory", "/x/memory", "3 file(s)"),
+            handoff.MemoryEntry(handoff.AGENT_CODEX, "memories_1.sqlite", "/y/memories_1.sqlite",
+                                "40.0 KiB, global (not project-specific), not parsed"),
+        ]
+        rendered = handoff.render_agent_memory_section(entries)
+        self.assertIn("Claude", rendered)
+        self.assertIn("/x/memory", rendered)
+        self.assertIn("not parsed", rendered)
+        self.assertIn("never treated as evidence", rendered)
+
+    def test_memory_section_is_embedded_in_the_full_handoff(self):
+        info = handoff.SessionInfo(agent="claude", session_id="s", path=self.tmp / "s.jsonl",
+                                   mtime=0.0, size=0)
+        pack = handoff.EvidencePack(session=info)
+        git = handoff.GitState(root=str(self.repo), branch="main", head="a" * 40)
+        entries = [handoff.MemoryEntry(handoff.AGENT_CODEX, "memories_1.sqlite",
+                                       "/home/.codex/memories_1.sqlite", "40.0 KiB, not parsed")]
+        rendered = handoff.render_deterministic_handoff(
+            pack, git, "2026-09-09T17:00:00-03:00", memory_entries=entries)
+        self.assertIn("## Agent Memory", rendered)
+        self.assertIn("memories_1.sqlite", rendered)
+        # Comes after Evidence, before Resume Instructions, in both modes.
+        self.assertLess(rendered.index("## Evidence"), rendered.index("## Agent Memory"))
+        self.assertLess(rendered.index("## Agent Memory"), rendered.index("## Resume Instructions"))
+
+    def test_memory_section_defaults_to_empty_when_not_passed(self):
+        info = handoff.SessionInfo(agent="claude", session_id="s", path=self.tmp / "s.jsonl",
+                                   mtime=0.0, size=0)
+        pack = handoff.EvidencePack(session=info)
+        git = handoff.GitState(root=str(self.repo), branch="main", head="a" * 40)
+        rendered = handoff.render_deterministic_handoff(pack, git, "2026-09-09T17:00:00-03:00")
+        self.assertIn("No agent memory found", rendered)
+
+
+# --------------------------------------------------------------------------
 # Handoff rendering
 # --------------------------------------------------------------------------
 
@@ -1078,7 +1242,7 @@ REQUIRED_SECTIONS = (
     "## Goal", "## Current State", "## Confirmed Completed Work", "## Relevant Files",
     "## Technical Decisions", "## Failed / Rejected Approaches", "## Known Problems",
     "## Pending Work", "## Suggested Next Steps", "## Unresolved Questions",
-    "## Git State", "## Evidence", "## Resume Instructions",
+    "## Git State", "## Evidence", "## Agent Memory", "## Resume Instructions",
 )
 
 
@@ -1127,7 +1291,7 @@ class TestHandoffRendering(TempDirCase):
             ai_body="## Goal\n\nModel written goal.\n")
         self.assertIn("Model written goal.", rendered)
         self.assertIn("AI-consolidated", rendered)
-        for section in ("## Git State", "## Evidence", "## Resume Instructions"):
+        for section in ("## Git State", "## Evidence", "## Agent Memory", "## Resume Instructions"):
             self.assertIn(section, rendered)
 
     def test_full_diff_is_never_embedded(self):

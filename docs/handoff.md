@@ -392,7 +392,60 @@ you point this at a new endpoint.
 
 ---
 
-## 10. Daily flow
+## 10. Agent memory
+
+Claude Code, Codex and Gemini CLI all keep some form of memory alongside the
+transcripts: Claude has a per-project `memory/` directory (individual fact
+files plus a `MEMORY.md` index), Codex keeps two global SQLite stores
+(`memories_1.sqlite`, `goals_1.sqlite`), and Gemini can carry a
+`memoryScratchpad` inside a session. Repo-root context files (`CLAUDE.md`,
+`GEMINI.md`) sit in the same category conceptually, even though they live in
+Git.
+
+This tool's evidence hierarchy (§1) exists specifically to distrust exactly
+this kind of thing: memory is an agent's *past interpretation*, frozen and
+detached from whatever produced it, with no mechanism to tell whether it is
+still accurate. A note saying "we decided to use X" has the same shape
+whether it is true or hallucinated, and nothing here can tell the difference
+after the fact. So memory is **indexed, not ingested**:
+
+- `doctor` and every generated `HANDOFF.md` list what exists, where, and how
+  fresh — file counts, sizes, last-modified dates, Git tracked/untracked
+  status;
+- none of it is opened, parsed, or folded into the ten analysis sections;
+- the Codex SQLite files in particular are never opened at all - their
+  schema is internal and undocumented, so this is presence and size only,
+  via `stat()`.
+
+```
+## Agent Memory
+
+Indexed only - never read by this tool, never treated as evidence. ...
+
+- **Claude** — Memory directory: `~/.claude/projects/<slug>/memory` (12 file(s), newest 2026-09-08)
+- **Claude** — Project instructions (CLAUDE.md): `CLAUDE.md` (2.1 KiB)
+- **Codex** — memories_1.sqlite: `~/.codex/memories_1.sqlite` (40.0 KiB, global (not project-specific), not parsed)
+- **Gemini** — Project instructions (GEMINI.md): `GEMINI.md` (1.5 KiB, untracked)
+```
+
+The one deliberate exception is Gemini's `memoryScratchpad`: it already lives
+inside the session file this tool parses, is scoped to that one session (not
+a global, cross-project store), and the CLI's own source tracks an explicit
+staleness flag for it — any message or rewind recorded after the scratchpad
+was last saved marks it stale. On that basis it is surfaced as a labeled
+compaction-style event in `conversation-tail.md` (clearly marked "possibly
+stale" or "fresh", and explicitly flagged as not confirmed fact), the same
+treatment already given to `<state_snapshot>` compaction summaries — not
+silently trusted, but not ignored either.
+
+If your real need is deeper than an index — pulling actual memory content
+into the handoff — that deserves a separate, explicitly opt-in command of its
+own rather than quietly widening what `HANDOFF.md` claims to guarantee.
+Nothing like that exists here today.
+
+---
+
+## 11. Daily flow
 
 ### Planned switch
 
@@ -430,7 +483,7 @@ python3 tools/handoff.py consolidate --ai
 
 ---
 
-## 11. Troubleshooting
+## 12. Troubleshooting
 
 **`error: not inside a Git repository`** — the tool derives the repository root
 from `git rev-parse --show-toplevel`. Run it from inside the checkout. No path
@@ -462,14 +515,14 @@ and pending work. That is the design. Use `--ai`, or read
 
 ---
 
-## 12. Tests
+## 13. Tests
 
 ```bash
 python3 -m py_compile tools/handoff.py
 python3 -m unittest discover -s tests -t .
 ```
 
-141 tests, standard library only. Fixtures are synthetic and reproduce only the
+156 tests, standard library only. Fixtures are synthetic and reproduce only the
 record shapes observed in real transcripts (or, for Gemini, documented in the
 installed package's own source - see §2) — no real session is committed. The
 suite covers normalization for all three agents, including Gemini's
@@ -481,7 +534,7 @@ against a local `http.server` stub.
 
 ---
 
-## 13. Deliberately out of scope
+## 14. Deliberately out of scope
 
 Vector embeddings, semantic search over history, an HTTP server, MCP, a web UI,
 multi-user support, cross-machine sync, a database, watchers, automatic

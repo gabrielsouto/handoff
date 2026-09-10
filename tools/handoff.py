@@ -1644,12 +1644,25 @@ class GeminiAdapter(BaseAdapter):
         messages: "Dict[str, Dict[str, Any]]" = {}
         invalid_lines = 0
 
+        # memoryScratchpad: the one piece of "agent memory" surfaced as
+        # evidence rather than merely indexed (see describe_agent_memory).
+        # It lives inside this very session file and carries its own
+        # explicit freshness flag in the source - mirrored exactly here:
+        # tracking (re)starts and staleness resets whenever a $set writes a
+        # non-empty scratchpad, and any later message or rewind marks it
+        # stale, because the conversation moved on without re-saving it.
+        memory_scratchpad: Optional[str] = None
+        tracking_memory_freshness = False
+        memory_scratchpad_stale = False
+
         for record, ok in iter_jsonl(path):
             if not ok or record is None:
                 invalid_lines += 1
                 continue
 
             if isinstance(record.get("$rewindTo"), str):
+                if tracking_memory_freshness:
+                    memory_scratchpad_stale = True
                 rewind_id = record["$rewindTo"]
                 if rewind_id in messages:
                     keep = []
@@ -1666,6 +1679,16 @@ class GeminiAdapter(BaseAdapter):
 
             update = record.get("$set")
             if isinstance(update, dict):
+                if "memoryScratchpad" in update:
+                    raw_scratchpad = update.get("memoryScratchpad")
+                    if isinstance(raw_scratchpad, str):
+                        memory_scratchpad = raw_scratchpad or None
+                    elif raw_scratchpad:
+                        memory_scratchpad = json.dumps(raw_scratchpad, ensure_ascii=False, default=str)
+                    else:
+                        memory_scratchpad = None
+                    tracking_memory_freshness = bool(raw_scratchpad)
+                    memory_scratchpad_stale = False
                 new_messages = update.get("messages")
                 if isinstance(new_messages, list):
                     messages = {}
@@ -1684,6 +1707,8 @@ class GeminiAdapter(BaseAdapter):
                 continue
 
             if isinstance(record.get("id"), str):
+                if tracking_memory_freshness:
+                    memory_scratchpad_stale = True
                 messages[record["id"]] = record
                 continue
             # Anything else is a record shape not documented anywhere I could
@@ -1693,8 +1718,21 @@ class GeminiAdapter(BaseAdapter):
             for event in self._normalize_message(message, session_id):
                 yield event, True
 
+        if memory_scratchpad:
+            yield self._memory_scratchpad_event(memory_scratchpad, memory_scratchpad_stale, session_id), True
+
         for _ in range(invalid_lines):
             yield None, False
+
+    @staticmethod
+    def _memory_scratchpad_event(text: str, stale: bool, session_id: str) -> NormalizedEvent:
+        freshness = ("possibly stale - the conversation continued after it was last saved"
+                    if stale else "fresh as of the most recent message")
+        body = ("Gemini's own memoryScratchpad (%s). Indexed as evidence here because it\n"
+                "lives inside this transcript, not confirmed fact - verify before relying on it.\n\n%s"
+                % (freshness, text))
+        return NormalizedEvent(kind=KIND_COMPACTION, agent=AGENT_GEMINI, session_id=session_id,
+                               tool_name="memory-scratchpad", text=body, raw_type="memoryScratchpad")
 
     def _normalize_message(self, record: Dict[str, Any], session_id: str) -> List[NormalizedEvent]:
         msg_type = str(record.get("type") or "")
@@ -1790,6 +1828,109 @@ def get_adapter(agent: str, repo_root: Path, home: Optional[Path] = None) -> Bas
     if agent == AGENT_GEMINI:
         return GeminiAdapter(repo_root, home)
     raise HandoffError("unknown agent '%s' (expected: %s)" % (agent, ", ".join(AGENTS)), EXIT_USAGE)
+
+
+# --------------------------------------------------------------------------
+# Agent memory - indexed, never ingested
+# --------------------------------------------------------------------------
+#
+# This tool's evidence hierarchy (Git > transcript > interpretation) treats
+# memory as untrustworthy by construction: it is an agent's past
+# interpretation, frozen and detached from whatever produced it, with no
+# mechanism here to tell whether it is still accurate. So memory is indexed -
+# what exists, where, how fresh - never read, never folded into the
+# handoff's analysis sections, and never treated as evidence.
+#
+# The one deliberate exception is Gemini's memoryScratchpad, which lives
+# inside the session transcript already being parsed and carries its own
+# explicit staleness flag; GeminiAdapter surfaces that separately (see
+# _memory_scratchpad_event), as a labeled compaction-like event, not through
+# the functions below.
+
+
+@dataclass
+class MemoryEntry:
+    agent: str
+    label: str
+    path: str
+    detail: str
+
+
+def describe_agent_memory(root: Path, git: GitState, home: Optional[Path] = None) -> List[MemoryEntry]:
+    """Existence/freshness only - stat() and directory listings, never a file open."""
+    home = Path(home) if home else Path.home()
+    entries: List[MemoryEntry] = []
+
+    # Claude Code: a per-project memory/ directory (individual fact files
+    # plus a MEMORY.md index), keyed by the same project-slug heuristic
+    # ClaudeAdapter uses to associate sessions with a repository.
+    claude_projects = home / ".claude" / "projects"
+    if claude_projects.is_dir():
+        for slug in ClaudeAdapter(root, home).expected_slugs():
+            memory_dir = claude_projects / slug / "memory"
+            if not memory_dir.is_dir():
+                continue
+            try:
+                files = [p for p in memory_dir.glob("*.md") if p.is_file()]
+            except OSError:
+                files = []
+            newest = max((p.stat().st_mtime for p in files), default=None)
+            detail = "%d file(s)" % len(files)
+            if newest is not None:
+                detail += ", newest %s" % datetime.fromtimestamp(newest).strftime("%Y-%m-%d")
+            entries.append(MemoryEntry(AGENT_CLAUDE, "Memory directory", str(memory_dir), detail))
+            break  # one matching project slug is enough evidence it exists
+
+    _describe_project_memory_file(entries, root, git, AGENT_CLAUDE, "CLAUDE.md")
+
+    # Codex: global (not per-project) SQLite stores. Schema is internal and
+    # undocumented, so these are never opened - presence and size only.
+    for name in ("memories_1.sqlite", "goals_1.sqlite"):
+        path = home / ".codex" / name
+        if path.is_file():
+            try:
+                size = human_size(path.stat().st_size)
+            except OSError:
+                size = "unknown size"
+            entries.append(MemoryEntry(
+                AGENT_CODEX, name, str(path), "%s, global (not project-specific), not parsed" % size))
+
+    # Gemini CLI: project-root context file, the same convention as
+    # CLAUDE.md/AGENTS.md.
+    _describe_project_memory_file(entries, root, git, AGENT_GEMINI, "GEMINI.md")
+
+    return entries
+
+
+def _describe_project_memory_file(
+    entries: List[MemoryEntry], root: Path, git: GitState, agent: str, filename: str
+) -> None:
+    path = root / filename
+    if not path.is_file():
+        return
+    try:
+        detail = human_size(path.stat().st_size)
+    except OSError:
+        detail = "unknown size"
+    if filename in git.untracked:
+        detail += ", untracked"
+    entries.append(MemoryEntry(agent, "Project instructions (%s)" % filename, str(path), detail))
+
+
+def render_agent_memory_section(entries: Sequence[MemoryEntry]) -> str:
+    lines = [
+        "\n## Agent Memory\n\n",
+        "Indexed only - never read by this tool, never treated as evidence. "
+        "Memory is an agent's past interpretation, frozen and detached from "
+        "whatever produced it; verify before trusting anything in it.\n\n",
+    ]
+    if not entries:
+        lines.append("No agent memory found at the usual locations.\n")
+        return "".join(lines)
+    for entry in entries:
+        lines.append("- **%s** — %s: `%s` (%s)\n" % (
+            AGENT_LABELS.get(entry.agent, entry.agent), entry.label, entry.path, entry.detail))
+    return "".join(lines)
 
 
 # --------------------------------------------------------------------------
@@ -2040,7 +2181,8 @@ def _relevant_files(pack: EvidencePack, git: GitState) -> List[str]:
 
 
 def render_deterministic_handoff(
-    pack: EvidencePack, git: GitState, generated_at: str, ai_body: Optional[str] = None
+    pack: EvidencePack, git: GitState, generated_at: str, ai_body: Optional[str] = None,
+    memory_entries: Sequence[MemoryEntry] = (),
 ) -> str:
     session = pack.session
     agent_label = AGENT_LABELS.get(session.agent, session.agent)
@@ -2161,6 +2303,8 @@ def render_deterministic_handoff(
     footer.append("Detailed Git snapshot:\n`.handoff/git-state.txt`\n\n")
     footer.append("Snapshot metadata:\n`.handoff/session.json`\n\n")
     footer.append("Source transcript (read-only, never modified by this tool):\n`%s`\n" % session.path)
+
+    footer.append(render_agent_memory_section(memory_entries))
 
     footer.append("\n## Resume Instructions\n\n")
     footer.append(
@@ -2630,7 +2774,8 @@ def run_snapshot(args: argparse.Namespace, mode: str) -> int:
         print("Redacted %d possible secret(s)." % redactor.count)
 
     digest = sha256_file(session.path)
-    handoff_text = render_deterministic_handoff(pack, git, generated_at, ai_body)
+    memory_entries = describe_agent_memory(root, git)
+    handoff_text = render_deterministic_handoff(pack, git, generated_at, ai_body, memory_entries)
 
     preserved = preserve_previous_handoff(workspace)
     workspace.handoff_dir.mkdir(parents=True, exist_ok=True)
@@ -2824,6 +2969,14 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     for agent in AGENTS:
         _agent_report(root, agent, detailed=True)
 
+    print("\nAgent memory (indexed, not read)")
+    memory_entries = describe_agent_memory(root, git)
+    if not memory_entries:
+        print("  none found at the usual locations")
+    for entry in memory_entries:
+        print("  %-7s %s: %s (%s)" % (
+            AGENT_LABELS.get(entry.agent, entry.agent) + ":", entry.label, entry.path, entry.detail))
+
     config = load_config(workspace.config_path)
     llm = config.get("llm") or {}
     base_url = str(llm.get("base_url") or "")
@@ -2986,7 +3139,8 @@ def cmd_consolidate(args: argparse.Namespace) -> int:
     else:
         print("No --ai given: rebuilding the deterministic handoff from the stored snapshot.")
 
-    handoff_text = render_deterministic_handoff(pack, git, generated_at, ai_body)
+    memory_entries = describe_agent_memory(root, git)
+    handoff_text = render_deterministic_handoff(pack, git, generated_at, ai_body, memory_entries)
     if ai_body is None and not conversation_tail:
         warn("without --ai and without conversation evidence this only refreshes Git facts.")
 
