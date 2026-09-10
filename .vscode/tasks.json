@@ -1,0 +1,95 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Handoff: Status",
+      "type": "shell",
+      "command": "python3 tools/handoff.py status",
+      "windows": { "command": "python tools/handoff.py status" },
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "panel": "shared", "clear": true },
+      "group": "none"
+    },
+    {
+      "label": "Handoff: Doctor",
+      "type": "shell",
+      "command": "python3 tools/handoff.py doctor",
+      "windows": { "command": "python tools/handoff.py doctor" },
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "panel": "shared", "clear": true }
+    },
+    {
+      "label": "Handoff: Snapshot Claude",
+      "type": "shell",
+      "command": "python3 tools/handoff.py snapshot claude",
+      "windows": { "command": "python tools/handoff.py snapshot claude" },
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "panel": "shared", "clear": true }
+    },
+    {
+      "label": "Handoff: Snapshot Codex",
+      "type": "shell",
+      "command": "python3 tools/handoff.py snapshot codex",
+      "windows": { "command": "python tools/handoff.py snapshot codex" },
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "panel": "shared", "clear": true }
+    },
+    {
+      "label": "Handoff: Recover Claude",
+      "type": "shell",
+      "command": "python3 tools/handoff.py recover claude",
+      "windows": { "command": "python tools/handoff.py recover claude" },
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "panel": "shared", "clear": true }
+    },
+    {
+      "label": "Handoff: Recover Claude with AI",
+      "type": "shell",
+      "command": "python3 tools/handoff.py recover claude --ai",
+      "windows": { "command": "python tools/handoff.py recover claude --ai" },
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "panel": "shared", "clear": true }
+    },
+    {
+      "label": "Handoff: Recover Codex",
+      "type": "shell",
+      "command": "python3 tools/handoff.py recover codex",
+      "windows": { "command": "python tools/handoff.py recover codex" },
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "panel": "shared", "clear": true }
+    },
+    {
+      "label": "Handoff: Recover Codex with AI",
+      "type": "shell",
+      "command": "python3 tools/handoff.py recover codex --ai",
+      "windows": { "command": "python tools/handoff.py recover codex --ai" },
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "panel": "shared", "clear": true }
+    },
+    {
+      "label": "Handoff: AI Preview (dry run)",
+      "type": "shell",
+      "command": "python3 tools/handoff.py recover claude --ai --dry-run",
+      "windows": { "command": "python tools/handoff.py recover claude --ai --dry-run" },
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "panel": "shared", "clear": true }
+    },
+    {
+      "label": "Handoff: Show",
+      "type": "shell",
+      "command": "python3 tools/handoff.py show",
+      "windows": { "command": "python tools/handoff.py show" },
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "panel": "shared", "clear": true }
+    },
+    {
+      "label": "Handoff: Tests",
+      "type": "shell",
+      "command": "python3 -m unittest discover -s tests -t .",
+      "windows": { "command": "python -m unittest discover -s tests -t ." },
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "panel": "shared", "clear": true },
+      "group": { "kind": "test", "isDefault": true }
+    }
+  ]
+}
