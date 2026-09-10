@@ -305,6 +305,4 @@ nova entram em conflito, confiabilidade vence.
 
 ## Licença
 
-Ainda sem arquivo de licença — todos os direitos reservados por padrão até
-que uma seja adicionada. Abra uma issue se quiser que isso seja formalmente
-open-source sob uma licença específica.
+[MIT](LICENSE) © 2026 Gabriel Souto.

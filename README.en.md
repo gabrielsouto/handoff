@@ -290,6 +290,4 @@ a new feature conflict, reliability wins.
 
 ## License
 
-No license file yet — all rights reserved by default until one is added.
-Open an issue if you'd like this formally open-sourced under a specific
-license.
+[MIT](LICENSE) © 2026 Gabriel Souto.
