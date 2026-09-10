@@ -96,6 +96,26 @@ class TestUtilities(TempDirCase):
         self.assertEqual(handoff.short_head("a" * 40), "a" * 12)
         self.assertEqual(handoff.short_head("(no commits yet)"), "(no commits yet)")
 
+    def test_safe_filename_component_passes_ordinary_ids_through(self):
+        self.assertEqual(handoff.safe_filename_component("4114df3c"), "4114df3c")
+        self.assertEqual(handoff.safe_filename_component("claude"), "claude")
+
+    def test_safe_filename_component_strips_path_separators(self):
+        for value in ("/", "\\", "a/b", "a\\b", "..", ".", "../../etc/passwd",
+                      "/../../../../outside/pwned"):
+            with self.subTest(value=value):
+                result = handoff.safe_filename_component(value)
+                self.assertNotIn("/", result)
+                self.assertNotIn("\\", result)
+                self.assertNotIn(result, (".", ".."))
+
+    def test_safe_filename_component_falls_back_when_nothing_survives(self):
+        self.assertEqual(handoff.safe_filename_component("", "fallback"), "fallback")
+        self.assertEqual(handoff.safe_filename_component(None, "fallback"), "fallback")
+        self.assertEqual(handoff.safe_filename_component("..", "fallback"), "fallback")
+        self.assertEqual(handoff.safe_filename_component("/", "fallback"), "fallback")
+        self.assertEqual(handoff.safe_filename_component("///", "fallback"), "fallback")
+
     def test_timestamp_conversion_keeps_offset_and_survives_garbage(self):
         converted = handoff.ts_to_iso("2026-09-09T18:33:29.650Z")
         self.assertRegex(converted, r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}$")
@@ -947,6 +967,22 @@ class TestHistoryArchiving(TempDirCase):
         target = handoff.archive_handoff(workspace, "2026-09-09T17:45:30-03:00", info, "body")
         self.assertEqual(target.name, "2026-09-09_174530_claude_4114df3c.md")
         self.assertTrue(handoff.HISTORY_NAME_RE.match(target.name))
+
+    def test_a_crafted_session_id_cannot_escape_the_history_directory(self):
+        # session_id is read straight out of the transcript's JSON; a
+        # --session-file an attacker handed the user could set it to anything,
+        # including path traversal sequences. The archive must stay inside
+        # history_dir regardless.
+        workspace = self.workspace()
+        for malicious_id in ("../../../../outside/pwned", "/../../etc/passwd",
+                             "..", ".", "../../..", "a/../../b"):
+            with self.subTest(session_id=malicious_id):
+                info = handoff.SessionInfo(agent="claude", session_id=malicious_id,
+                                           path=self.tmp / "s.jsonl", mtime=0.0, size=0)
+                target = handoff.archive_handoff(
+                    workspace, "2026-09-09T17:45:30-03:00", info, "content")
+                self.assertEqual(target.resolve().parent, workspace.history_dir.resolve())
+                self.assertTrue(target.is_file())
 
     def test_repeated_archives_never_overwrite_each_other(self):
         workspace = self.workspace()

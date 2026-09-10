@@ -207,6 +207,25 @@ def short_id(session_id: Optional[str], length: int = 8) -> str:
     return str(session_id)[:length]
 
 
+_UNSAFE_FILENAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def safe_filename_component(value: Optional[str], fallback: str = "unknown") -> str:
+    """Make a string safe to use as exactly one filesystem path component.
+
+    session_id and agent both end up in a filename (see archive_handoff). Both
+    are read from the transcript - agent is normally fixed by this tool, but
+    session_id comes straight from JSON an attacker-crafted --session-file
+    could control. Strip anything but letters, digits, dot, dash and
+    underscore, and refuse a result that collapses to '.' or '..' - either
+    one is a directory reference, not a filename, even with no slash in it.
+    """
+    text = _UNSAFE_FILENAME_RE.sub("_", str(value or "")).strip("_")
+    if not text or text in (".", ".."):
+        return fallback
+    return text
+
+
 def short_head(head: Optional[str], length: int = 12) -> str:
     """Abbreviate a real commit sha; leave placeholders like '(no commits yet)' intact."""
     if not head:
@@ -2104,12 +2123,18 @@ def archive_handoff(workspace: Workspace, generated_at: str, session: SessionInf
         pretty = "%s-%s-%s_%s%s%s" % match.groups()
     else:
         pretty = datetime.now().strftime("%Y-%m-%d_%H%M%S")
-    name = "%s_%s_%s.md" % (pretty, session.agent, short_id(session.session_id))
+    # session_id comes straight from the transcript's JSON - sanitize it before
+    # it becomes part of a filename, so a crafted --session-file can't smuggle
+    # "../" through here (session.agent is normally fixed by this tool, but
+    # costs nothing to sanitize the same way).
+    safe_agent = safe_filename_component(session.agent, "agent")
+    safe_session = safe_filename_component(short_id(session.session_id), "session")
+    name = "%s_%s_%s.md" % (pretty, safe_agent, safe_session)
     target = workspace.history_dir / name
     counter = 1
     while target.exists():
         target = workspace.history_dir / ("%s_%s_%s_%d.md" % (
-            pretty, session.agent, short_id(session.session_id), counter))
+            pretty, safe_agent, safe_session, counter))
         counter += 1
     atomic_write(target, content)
     return target
