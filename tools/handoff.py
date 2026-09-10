@@ -3059,7 +3059,7 @@ def cmd_show(args: argparse.Namespace) -> int:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="handoff.py",
-        description="Generate a handoff between Claude Code and OpenAI Codex "
+        description="Generate a handoff between Claude Code, OpenAI Codex and Gemini CLI "
                     "from the transcripts they already write.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="Typical use:\n"
