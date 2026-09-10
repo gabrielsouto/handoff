@@ -2,12 +2,13 @@
 
 *[Leia em português](README.md)*
 
-**A session dies mid-task. The transcript is still on disk. This reads it.**
+**A session dies mid-task. The transcript is still on disk. That's where the handoff comes from.**
 
 `tools/handoff.py` turns the JSONL transcripts that Claude Code, OpenAI Codex
-and Gemini CLI already write to disk into a single `HANDOFF.md` — a
-factual, git-aware summary the next agent (or the next you) can pick up in
-the same checkout, without losing what was already done.
+and Gemini CLI already write to disk into a single `HANDOFF.md`: a factual
+summary, anchored in the real state of Git, that the next agent — or you,
+hours later — uses to pick the work back up in the same checkout without
+losing what was already done.
 
 No daemon. No server. No database. No dependencies to install. One Python
 file, standard library only.
@@ -29,24 +30,24 @@ tools/handoff.py
 HANDOFF.md
      │
      ▼
-Codex reads it, continues the work
+Codex reads it and continues the work
 ```
 
 ---
 
 ## Why
 
-The usual options for continuing an AI coding session across a quota limit,
-a closed window, or a switch of agent are:
+To pick an AI coding session back up after a quota limit, a closed window or
+a switch of agent, there are usually two options:
 
-- a `HANDOFF.md` you write and update by hand, or
-- a full memory platform: a server, MCP, a vector database, a daemon.
+- write and maintain a `HANDOFF.md` by hand; or
+- stand up a full memory platform — a server, MCP, a vector database, a daemon.
 
-This sits in between. It reads the transcripts the agents *already write* —
-no hooks, no interception, no new state to maintain — and turns them into a
-handoff automatically, in seconds, entirely on your machine.
+This tool sits in between. It reads the transcripts the agents *already
+write* (no hooks, no interception, no new state to maintain) and builds the
+handoff on its own, in seconds, entirely on your machine.
 
-## What it guarantees
+## Guarantees
 
 - **Read-only, always.** Nothing under `~/.claude/`, `~/.codex/` or
   `~/.gemini/` is ever edited, moved, renamed or deleted.
@@ -62,8 +63,8 @@ handoff automatically, in seconds, entirely on your machine.
   exact payload (`ai-input-preview.md`) before it's ever sent.
 - **One copy serves every project.** Point the same script at any checkout
   with `--repo` or `$HANDOFF_REPO`; nothing needs to be installed per-repo.
-- **Streams, never loads a transcript whole.** A real 112 MiB Codex session
-  parses in ~2.4 s with a ~31 MiB peak Python heap.
+- **Streams; never loads a whole transcript into memory.** A real 112 MiB
+  Codex session parses in ~2.4 s with a ~31 MiB peak Python heap.
 
 ## Supported agents
 
@@ -84,15 +85,15 @@ normalized event shape; nothing else in the tool changes.
 - Git
 - Claude Code, Codex and/or Gemini CLI, for whichever agents you use
 
-## Get it
+## Install
 
 ```bash
 git clone https://github.com/gabrielsouto/handoff.git
 ```
 
-Keep this folder wherever you like — it doesn't need to live inside the
-projects it works on. Optionally run `init` once per repository you'll use it
-on, from inside that repository:
+Keep this folder wherever you like: it doesn't need to live inside the
+projects it works on. Optionally, run `init` once in each repository you plan
+to use it with, from inside that repository:
 
 ```bash
 cd /path/to/your/project
@@ -104,9 +105,9 @@ python3 /path/to/handoff/tools/handoff.py init
 `.gitignore`, idempotently), and appends an **Agent handoff** section to
 `AGENTS.md` if one already exists (it never creates one for you).
 
-There are three thin wrappers in this repo so the command is shorter from
-wherever you keep it — `./handoff` (sh), `handoff.cmd`, `handoff.ps1` — all
-forwarding every argument to `tools/handoff.py`:
+Three thin wrappers in this repo shorten the call, wherever you keep the
+tool: `./handoff` (sh), `handoff.cmd` and `handoff.ps1`. All of them forward
+every argument to `tools/handoff.py`:
 
 ```bash
 ./handoff recover claude --repo /path/to/your/project
@@ -117,11 +118,11 @@ forwarding every argument to `tools/handoff.py`:
 ## Quick start
 
 ```bash
-python3 tools/handoff.py doctor       # what does it see on this machine?
-python3 tools/handoff.py status       # short summary of repo + sessions
+python3 tools/handoff.py doctor       # what the tool sees on this machine
+python3 tools/handoff.py status       # summary of the repository and the sessions
 ```
 
-**Planned switch of agent** — you're about to stop and hand off on purpose:
+**A planned agent switch**, when you're about to stop and hand off on purpose:
 
 ```bash
 python3 tools/handoff.py snapshot claude --ai
@@ -132,15 +133,15 @@ Then, in Codex:
 > Read AGENTS.md and HANDOFF.md and continue the current work. Inspect Git
 > and the code before making any change.
 
-**Emergency** — a session died and you never got a summary:
+**An emergency**, when the session died before you could ask for a summary:
 
 ```bash
 python3 tools/handoff.py recover claude --ai
 ```
 
-Drop `--ai` in either case if you don't have an LLM endpoint configured —
-you still get a complete, honest `HANDOFF.md`, just without the model's
-narrative synthesis of the ten analysis sections.
+With no LLM endpoint configured, just drop the `--ai`: the `HANDOFF.md` comes
+out complete either way, only without the model's synthesis of the ten
+analysis sections.
 
 ---
 
@@ -159,7 +160,7 @@ python3 tools/handoff.py history               # list archived handoffs
 python3 tools/handoff.py show                  # print HANDOFF.md
 ```
 
-`snapshot` and `recover` run the identical pipeline; the two names exist so
+`snapshot` and `recover` run the exact same pipeline; the two names exist so
 the intent is obvious at the moment you reach for one. Every command accepts
 `--repo PATH` and `--verbose`, before or after the subcommand;
 `snapshot`/`recover` also accept `--session ID`, `--session-file PATH`,
@@ -193,13 +194,13 @@ LLM failure falls back to the deterministic handoff with exit 0).
 
 ## How a session gets picked
 
-In order of strength: the working directory **recorded inside the session
-itself** (Claude/Codex: read from the transcript head; Gemini: read from its
-`.project_root` marker file) beats a **directory-name hint**, which beats
-nothing found. Automatic selection takes the most recent confirmed session,
-then the most recent hinted one, and **never** silently guesses a session
-that belongs to a different checkout — if every candidate is foreign, the
-command refuses and tells you to pick explicitly:
+In order of strength, the working directory **recorded inside the session
+itself** (Claude and Codex carry it at the head of the transcript; Gemini, in
+its `.project_root` marker file) beats a **directory-name hint**, which in
+turn beats no evidence at all. Automatic selection takes the most recent
+confirmed session, then the most recent hinted one, and **never** silently
+assumes a session from a different checkout: if every candidate belongs to
+another project, the command refuses and asks you to choose explicitly.
 
 ```bash
 python3 tools/handoff.py recover claude --session 4114df3c-a38c-49c9
@@ -227,17 +228,20 @@ never contains a full diff — the next agent shares the checkout and can run
 
 ## The optional LLM
 
-By default there is no LLM integration and nothing here ever opens a socket.
-Fill in `base_url` and `model` in `.handoff/config.json` (any
-OpenAI-compatible `/v1/chat/completions` endpoint) or export
-`HANDOFF_LLM_BASE_URL` to turn it on; set `"enabled": false` to force it back
-off. `--ai` is always safe to pass — with nothing configured, or if the
-endpoint is unreachable, it explains why and falls back to the deterministic
-handoff instead of failing the whole command.
+By default there is no LLM integration at all, and nothing here opens a
+socket. To turn it on, fill in `base_url` and `model` in
+`.handoff/config.json` (any `/v1/chat/completions` endpoint compatible with
+the OpenAI API) or export `HANDOFF_LLM_BASE_URL`; to keep it off for good,
+set `"enabled": false`.
 
-When it *is* configured, the model never sees the raw transcript: a single
-streaming pass builds a bounded, truncated, redacted Evidence Pack first, and
-you can audit the exact payload with `--dry-run` before anything is sent.
+Passing `--ai` is always safe: with nothing configured, or with the endpoint
+down, it explains why and falls back to the deterministic handoff instead of
+bringing the whole command down with it.
+
+Even with an endpoint configured, the model still never sees the raw
+transcript. A single streaming pass builds the Evidence Pack first — bounded,
+truncated and with secrets redacted — and `--dry-run` shows you the exact
+payload before anything is sent.
 
 ## Security notes
 
@@ -246,9 +250,10 @@ Best-effort redaction runs over everything before it's written or sent:
 assignments, `sk-…`, `sk-ant-…`, `ghp_…`, AWS/Google key patterns, JWTs and
 `PRIVATE KEY` blocks all become `[REDACTED]`. Files that look like a
 credential store (`.env`, `auth.json`, `id_rsa`, `*.pem`, …) have their
-content dropped outright rather than redacted. This is defence in depth, not
-a DLP guarantee — read `.handoff/ai-input-preview.md` the first time you
-point this at a new endpoint.
+content dropped outright rather than redacted.
+
+This is defense in depth, not a DLP guarantee. The first time you point the
+tool at a new endpoint, read `.handoff/ai-input-preview.md`.
 
 ---
 
