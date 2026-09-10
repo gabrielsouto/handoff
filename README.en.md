@@ -24,6 +24,7 @@ tools/handoff.py
      │
      ├── current Git state
      ├── selected transcript evidence
+     ├── agent memory index (existence only, never content)
      └── optional LLM consolidation
      │
      ▼
