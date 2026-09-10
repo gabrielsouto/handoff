@@ -620,6 +620,216 @@ class TestCodexAdapter(TempDirCase):
         self.assertEqual(adapter.discover()[0].path.name, older_path_newer_mtime.name)
 
 
+def gemini_header(session_id="e6dfec33"):
+    return {"sessionId": session_id, "projectHash": "a7da309f74d7b760",
+            "startTime": "2026-09-10T01:06:13.954Z",
+            "lastUpdated": "2026-09-10T01:06:13.954Z", "kind": "main"}
+
+
+def gemini_records():
+    """One of each record shape confirmed against @google/gemini-cli 0.59.0's
+    own chatRecordingService.js (see GeminiAdapter's docstring); no $set.messages
+    or $rewindTo here on purpose - those overwrite/erase and are exercised in
+    their own small, isolated fixtures below instead."""
+    return [
+        gemini_header(),
+        {"id": "ctx", "timestamp": "2026-09-10T01:06:13.956Z", "type": "user",
+         "content": [{"text": "<session_context>\nThis is the Gemini CLI.\n</session_context>"}]},
+        {"id": "u1", "timestamp": "2026-09-10T01:06:14.000Z", "type": "user",
+         "content": [{"text": "implement the parser"}]},
+        {"id": "g1", "timestamp": "2026-09-10T01:06:15.000Z", "type": "gemini", "model": "gemini-3-pro",
+         "content": [{"text": "Sure, reading the file first."},
+                     {"functionCall": {"id": "call1", "name": "read_file",
+                                       "args": {"absolute_path": "/repo/src/app.py"}}}]},
+        {"id": "u1_response", "timestamp": "2026-09-10T01:06:15.500Z", "type": "user",
+         "content": [{"functionResponse": {"id": "call1", "name": "read_file",
+                                           "response": {"output": "file body"}}}]},
+        {"id": "g2", "timestamp": "2026-09-10T01:06:16.000Z", "type": "gemini", "content": "",
+         "toolCalls": [{"id": "call2", "name": "run_shell_command",
+                        "args": {"command": "python setup.py test"},
+                        "result": "Exit code 1\nTraceback: boom"}]},
+        {"id": "e1", "timestamp": "2026-09-10T01:06:17.000Z", "type": "error",
+         "content": [{"text": "API key not valid. Please pass a valid API key."}]},
+        {"id": "i1", "timestamp": "2026-09-10T01:06:17.500Z", "type": "info",
+         "content": [{"text": "Binary content received."}]},
+        {"id": "w1", "timestamp": "2026-09-10T01:06:17.600Z", "type": "warning",
+         "content": [{"text": "rate limited, retrying"}]},
+        {"id": "cs1", "timestamp": "2026-09-10T01:06:18.000Z", "type": "user",
+         "content": [{"text": "<state_snapshot>\nProject status: parser started.\n</state_snapshot>"}]},
+        {"id": "ack1", "timestamp": "2026-09-10T01:06:18.100Z", "type": "gemini",
+         "content": [{"text": "Got it. Thanks for the additional context!"}]},
+    ]
+
+
+class TestGeminiAdapter(TempDirCase):
+    def setUp(self):
+        super().setUp()
+        self.session = self.tmp / "session-2026-09-10T01-06-e6dfec33.jsonl"
+        write_jsonl(self.session, gemini_records())
+        self.adapter = handoff.GeminiAdapter(Path("/repo"), home=self.tmp)
+
+    def events(self):
+        return [event for event, ok in self.adapter.iter_events(self.session) if ok]
+
+    def test_slugify_matches_the_project_registrys_own_algorithm(self):
+        self.assertEqual(handoff.GeminiAdapter.slugify("gemini_probe"), "gemini-probe")
+        self.assertEqual(handoff.GeminiAdapter.slugify("  My Project!! "), "my-project")
+        self.assertEqual(handoff.GeminiAdapter.slugify("///"), "project")
+
+    def test_session_id_from_path_reads_the_trailing_short_id(self):
+        self.assertEqual(
+            handoff.GeminiAdapter.session_id_from_path(self.session), "e6dfec33")
+
+    def test_ignored_context_block_produces_no_user_event(self):
+        users = [e for e in self.events() if e.kind == handoff.KIND_USER]
+        self.assertEqual([e.text for e in users], ["implement the parser"])
+
+    def test_assistant_text_and_inline_function_call_are_both_captured(self):
+        assistants = [e for e in self.events() if e.kind == handoff.KIND_ASSISTANT]
+        self.assertEqual(assistants[0].text, "Sure, reading the file first.")
+        calls = [e for e in self.events() if e.kind == handoff.KIND_TOOL_CALL]
+        read_call = next(c for c in calls if c.tool_name == "read_file")
+        self.assertIn("/repo/src/app.py", read_call.file_paths)
+        self.assertFalse(read_call.mutating)
+
+    def test_function_response_in_a_user_message_is_a_tool_result_not_chat(self):
+        # This is the trap: a "user"-type record carrying a functionResponse
+        # part is a tool result, not something a human typed.
+        results = [e for e in self.events() if e.kind == handoff.KIND_TOOL_RESULT]
+        self.assertTrue(any(e.text == "file body" and e.tool_name == "read_file" for e in results))
+        users = [e for e in self.events() if e.kind == handoff.KIND_USER]
+        self.assertFalse(any("file body" in (e.text or "") for e in users))
+
+    def test_toolcalls_array_shape_yields_a_call_and_a_failing_result(self):
+        calls = [e for e in self.events() if e.kind == handoff.KIND_TOOL_CALL and e.tool_name == "run_shell_command"]
+        self.assertEqual(len(calls), 1)
+        # "python setup.py test" doesn't match any mutation keyword: not flagged.
+        self.assertFalse(calls[0].mutating)
+        errors = [e for e in self.events() if e.kind == handoff.KIND_TOOL_ERROR
+                 and e.tool_name == "run_shell_command"]
+        self.assertEqual(len(errors), 1)
+        self.assertIn("Traceback", errors[0].text)
+
+    def test_shell_tool_mutation_is_judged_from_the_command_text(self):
+        path = self.tmp / "shell.jsonl"
+        write_jsonl(path, [
+            gemini_header(),
+            {"id": "g1", "type": "gemini", "content": "", "toolCalls": [
+                {"id": "c1", "name": "run_shell_command",
+                 "args": {"command": "echo hi >> out.txt"}, "result": "ok"}]},
+        ])
+        events = [e for e, ok in self.adapter.iter_events(path) if ok]
+        call = next(e for e in events if e.kind == handoff.KIND_TOOL_CALL)
+        self.assertTrue(call.mutating)
+
+    def test_error_type_message_becomes_a_tool_error(self):
+        errors = [e for e in self.events() if e.kind == handoff.KIND_TOOL_ERROR and e.tool_name is None]
+        self.assertTrue(any("API key not valid" in e.text for e in errors))
+
+    def test_info_and_warning_messages_are_dropped(self):
+        texts = [e.text for e in self.events()]
+        self.assertFalse(any("Binary content received" in t for t in texts))
+        self.assertFalse(any("rate limited" in t for t in texts))
+
+    def test_state_snapshot_is_compaction_and_the_ack_reply_is_dropped(self):
+        compactions = [e for e in self.events() if e.kind == handoff.KIND_COMPACTION]
+        self.assertEqual(len(compactions), 1)
+        self.assertIn("Project status", compactions[0].text)
+        texts = [e.text for e in self.events()]
+        self.assertFalse(any("Got it. Thanks for the additional context!" in t for t in texts))
+
+    def test_set_messages_fully_replaces_the_message_list(self):
+        path = self.tmp / "resync.jsonl"
+        write_jsonl(path, [
+            gemini_header(),
+            {"id": "a", "type": "user", "content": [{"text": "first"}]},
+            {"id": "b", "type": "user", "content": [{"text": "second"}]},
+            {"$set": {"messages": [
+                {"id": "b", "type": "user", "content": [{"text": "second (edited)"}]}]}},
+        ])
+        events = [e for e, ok in self.adapter.iter_events(path) if ok]
+        texts = [e.text for e in events]
+        self.assertEqual(texts, ["second (edited)"])
+        self.assertNotIn("first", texts)
+
+    def test_rewind_removes_the_target_and_everything_recorded_after_it(self):
+        path = self.tmp / "rewind.jsonl"
+        write_jsonl(path, [
+            gemini_header(),
+            {"id": "a", "type": "user", "content": [{"text": "first"}]},
+            {"id": "b", "type": "user", "content": [{"text": "second"}]},
+            {"id": "c", "type": "user", "content": [{"text": "third"}]},
+            {"$rewindTo": "b"},
+        ])
+        events = [e for e, ok in self.adapter.iter_events(path) if ok]
+        self.assertEqual([e.text for e in events], ["first"])
+
+    def test_rewind_to_an_unknown_id_clears_everything(self):
+        path = self.tmp / "rewind_unknown.jsonl"
+        write_jsonl(path, [
+            gemini_header(),
+            {"id": "a", "type": "user", "content": [{"text": "first"}]},
+            {"$rewindTo": "never-existed"},
+        ])
+        events = [e for e, ok in self.adapter.iter_events(path) if ok]
+        self.assertEqual(events, [])
+
+    def test_invalid_lines_are_counted_even_though_events_are_replayed_at_the_end(self):
+        path = self.tmp / "mixed.jsonl"
+        with open(path, "w", encoding="utf-8", newline="\n") as handle:
+            handle.write(json.dumps(gemini_header()) + "\n")
+            handle.write("{broken\n")
+            handle.write(json.dumps({"id": "a", "type": "user",
+                                     "content": [{"text": "hello"}]}) + "\n")
+        results = list(self.adapter.iter_events(path))
+        good = [event for event, ok in results if ok]
+        bad = [event for event, ok in results if not ok]
+        self.assertEqual([e.text for e in good], ["hello"])
+        self.assertEqual(len(bad), 1)
+
+    def test_candidate_files_excludes_nested_subagent_sessions(self):
+        base = self.tmp / ".gemini" / "tmp" / "myproj" / "chats"
+        base.mkdir(parents=True)
+        write_jsonl(base / "session-main.jsonl", gemini_records())
+        nested = base / "parent-session-id"
+        nested.mkdir()
+        write_jsonl(nested / "sub-agent.jsonl", gemini_records())
+        adapter = handoff.GeminiAdapter(Path("/repo"), home=self.tmp)
+        found = adapter.candidate_files()
+        self.assertEqual([p.name for p in found], ["session-main.jsonl"])
+
+    def test_probe_reads_cwd_from_the_project_root_marker(self):
+        slug_dir = self.tmp / ".gemini" / "tmp" / "myproj"
+        chats = slug_dir / "chats"
+        chats.mkdir(parents=True)
+        (slug_dir / ".project_root").write_text("/repo", encoding="utf-8")
+        session = chats / "session-x.jsonl"
+        write_jsonl(session, gemini_records())
+        adapter = handoff.GeminiAdapter(Path("/repo"), home=self.tmp)
+        session_id, cwd = adapter.probe(session)
+        self.assertEqual(cwd, "/repo")
+        self.assertEqual(session_id, "e6dfec33")
+
+    def test_discovery_confirms_via_the_project_root_marker(self):
+        home_gemini = self.tmp / ".gemini" / "tmp"
+        for slug, cwd in (("mine", "/repo"), ("theirs", "/somewhere/else")):
+            chats = home_gemini / slug / "chats"
+            chats.mkdir(parents=True)
+            (home_gemini / slug / ".project_root").write_text(cwd, encoding="utf-8")
+            write_jsonl(chats / ("session-%s.jsonl" % slug), gemini_records())
+        adapter = handoff.GeminiAdapter(Path("/repo"), home=self.tmp)
+        by_slug = {info.path.parent.parent.name: info for info in adapter.discover()}
+        self.assertEqual(by_slug["mine"].match, "confirmed")
+        self.assertEqual(by_slug["theirs"].match, "foreign")
+
+    def test_path_hint_matches_the_repository_basename_when_no_marker_exists(self):
+        adapter = handoff.GeminiAdapter(Path("/some/where/my-repo"), home=self.tmp)
+        fake_path = self.tmp / ".gemini" / "tmp" / "my-repo" / "chats" / "session-x.jsonl"
+        self.assertTrue(adapter.path_hint_matches(fake_path))
+        other_path = self.tmp / ".gemini" / "tmp" / "unrelated" / "chats" / "session-x.jsonl"
+        self.assertFalse(adapter.path_hint_matches(other_path))
+
+
 # --------------------------------------------------------------------------
 # Evidence building
 # --------------------------------------------------------------------------
@@ -1177,7 +1387,7 @@ class TestCli(unittest.TestCase):
     def test_unknown_agent_is_rejected_by_the_parser(self):
         with contextlib.redirect_stderr(io.StringIO()):
             with self.assertRaises(SystemExit):
-                handoff.build_parser().parse_args(["snapshot", "gemini"])
+                handoff.build_parser().parse_args(["snapshot", "grok"])
 
     def test_running_without_a_command_returns_the_usage_exit_code(self):
         buffer = io.StringIO()
@@ -1188,8 +1398,13 @@ class TestCli(unittest.TestCase):
 
     def test_get_adapter_rejects_unknown_agents_with_a_usage_error(self):
         with self.assertRaises(handoff.HandoffError) as caught:
-            handoff.get_adapter("gemini", Path("/repo"))
+            handoff.get_adapter("grok", Path("/repo"))
         self.assertEqual(caught.exception.code, handoff.EXIT_USAGE)
+
+    def test_get_adapter_resolves_all_three_known_agents(self):
+        self.assertIsInstance(handoff.get_adapter("claude", Path("/repo")), handoff.ClaudeAdapter)
+        self.assertIsInstance(handoff.get_adapter("codex", Path("/repo")), handoff.CodexAdapter)
+        self.assertIsInstance(handoff.get_adapter("gemini", Path("/repo")), handoff.GeminiAdapter)
 
     def test_repo_flag_is_accepted_before_and_after_the_subcommand(self):
         parser = handoff.build_parser()

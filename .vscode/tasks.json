@@ -67,6 +67,30 @@
       "presentation": { "reveal": "always", "panel": "shared", "clear": true }
     },
     {
+      "label": "Handoff: Snapshot Gemini",
+      "type": "shell",
+      "command": "python3 tools/handoff.py snapshot gemini",
+      "windows": { "command": "python tools/handoff.py snapshot gemini" },
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "panel": "shared", "clear": true }
+    },
+    {
+      "label": "Handoff: Recover Gemini",
+      "type": "shell",
+      "command": "python3 tools/handoff.py recover gemini",
+      "windows": { "command": "python tools/handoff.py recover gemini" },
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "panel": "shared", "clear": true }
+    },
+    {
+      "label": "Handoff: Recover Gemini with AI",
+      "type": "shell",
+      "command": "python3 tools/handoff.py recover gemini --ai",
+      "windows": { "command": "python tools/handoff.py recover gemini --ai" },
+      "problemMatcher": [],
+      "presentation": { "reveal": "always", "panel": "shared", "clear": true }
+    },
+    {
       "label": "Handoff: AI Preview (dry run)",
       "type": "shell",
       "command": "python3 tools/handoff.py recover claude --ai --dry-run",

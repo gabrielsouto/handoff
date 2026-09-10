@@ -65,8 +65,9 @@ LEGACY_EXCLUDE_RULES = {
 
 AGENT_CLAUDE = "claude"
 AGENT_CODEX = "codex"
-AGENTS = (AGENT_CLAUDE, AGENT_CODEX)
-AGENT_LABELS = {AGENT_CLAUDE: "Claude", AGENT_CODEX: "Codex"}
+AGENT_GEMINI = "gemini"
+AGENTS = (AGENT_CLAUDE, AGENT_CODEX, AGENT_GEMINI)
+AGENT_LABELS = {AGENT_CLAUDE: "Claude", AGENT_CODEX: "Codex", AGENT_GEMINI: "Gemini"}
 
 # Normalized event kinds.
 KIND_USER = "user_message"
@@ -84,7 +85,7 @@ MUTATING_TOOL_NAMES = {
     "str_replace_editor", "str_replace_based_edit_tool", "apply_patch",
     "patch", "update_file", "write_file", "edit_file", "filechange",
 }
-MUTATION_KEYWORDS = ("write", "edit", "patch", "create", "delete")
+MUTATION_KEYWORDS = ("write", "edit", "patch", "create", "delete", "replace")
 
 # The LLM is entirely optional and OFF by default: there may be no endpoint at
 # all. Nothing contacts the network until base_url and model are filled in and
@@ -732,6 +733,33 @@ def is_mutating_tool(name: Optional[str]) -> bool:
     return any(keyword in lowered for keyword in MUTATION_KEYWORDS)
 
 
+def looks_like_mutating_shell_text(text: Optional[str]) -> bool:
+    """Best-effort: does a shell command / free-form tool input write to disk?
+
+    Used for tools whose own name gives no hint (Codex's "exec", Gemini's
+    "run_shell_command") - the mutation signal has to come from the command
+    text itself instead of the tool name.
+    """
+    lowered = (text or "")[:2000].lower()
+    return any(token in lowered for token in
+               ("apply_patch", "set-content", "out-file", ">>", "add-content"))
+
+
+def looks_like_failed_output(text: Optional[str]) -> bool:
+    """Best-effort: does a tool result/output look like a failure?
+
+    Shared by adapters whose transcripts don't carry an explicit
+    success/failure flag on the result (Codex's function_call_output,
+    Gemini's toolCalls[].result) and so must be judged from the text itself.
+    """
+    head = (text or "")[:1500]
+    if re.search(r'"exit_code"\s*:\s*[1-9]', head):
+        return True
+    if re.search(r"(?im)^\s*(exit code|exit status)\s*[:=]?\s*[1-9]", head):
+        return True
+    return bool(re.search(r"(?i)\b(traceback \(most recent call last\)|fatal error|command failed)\b", head))
+
+
 # --------------------------------------------------------------------------
 # Adapters
 # --------------------------------------------------------------------------
@@ -1347,18 +1375,11 @@ class CodexAdapter(BaseAdapter):
 
     @staticmethod
     def _input_mutates(text: str) -> bool:
-        lowered = (text or "")[:2000].lower()
-        return any(token in lowered for token in
-                   ("apply_patch", "set-content", "out-file", ">>", "add-content"))
+        return looks_like_mutating_shell_text(text)
 
     @staticmethod
     def _looks_like_failure(text: str) -> bool:
-        head = (text or "")[:1500]
-        if re.search(r'"exit_code"\s*:\s*[1-9]', head):
-            return True
-        if re.search(r"(?im)^\s*(exit code|exit status)\s*[:=]?\s*[1-9]", head):
-            return True
-        return bool(re.search(r"(?i)\b(traceback \(most recent call last\)|fatal error|command failed)\b", head))
+        return looks_like_failed_output(text)
 
     @staticmethod
     def _flatten_content(content: Any) -> str:
@@ -1383,11 +1404,391 @@ class CodexAdapter(BaseAdapter):
         return str(content)
 
 
+_GEMINI_SESSION_ID_RE = re.compile(r"-([0-9a-fA-F]{8})\.jsonl?$")
+_GEMINI_ACK_TEXT = "Got it. Thanks for the additional context!"
+_GEMINI_SHELL_TOOL_NAMES = {"run_shell_command", "execute_command", "shell"}
+
+
+class GeminiAdapter(BaseAdapter):
+    """Reads ~/.gemini/tmp/<project-slug>/chats/session-*.jsonl.
+
+    There is no complete real transcript to inspect: the Gemini CLI (npm
+    package @google/gemini-cli) needs a Google account or API key to complete
+    a turn, and neither was available in the environment this adapter was
+    built in. What follows was cross-checked two ways instead:
+
+    1. A real, on-disk (if incomplete - it errored out before any model reply)
+       session produced by running the actual CLI headless, confirming the
+       project-registry layout (~/.gemini/projects.json, .project_root marker
+       files) and the header/plain-message record shapes.
+    2. The unminified source the npm package ships with its own bundle
+       (packages/core/dist/src/services/chatRecordingService.js and
+       .../config/projectRegistry.js, @google/gemini-cli 0.59.0) - read
+       directly for every record shape and merge rule below, including ones
+       the incomplete probe session never exercised (tool calls, thoughts,
+       compaction, $set/$rewindTo semantics).
+
+    Record shapes:
+      Line 1: {"sessionId":..., "projectHash":..., "startTime":...,
+               "lastUpdated":..., "kind":"main"|"subagent", "directories"?}
+      Message record (has a string "id"):
+        {"id":..., "timestamp":..., "type":"user"|"gemini"|"info"|"error"
+                                          |"warning",
+         "content": <string, or a list of GenAI Part-like objects
+                     (text / functionCall / functionResponse / thought /
+                     inlineData / ...)>,
+         # "gemini" messages only:
+         "thoughts"?: [...], "tokens"?: {...}, "model"?: str,
+         "toolCalls"?: [{"id","name","args","result"?,"displayName",...}]}
+      {"$set": {...partial metadata...}} - a partial update. When it carries
+        a "messages" array, that array *replaces* the entire message list
+        built so far (used by periodic history resyncs) rather than adding
+        to it.
+      {"$rewindTo": "<messageId>"} - discards that message and everything
+        recorded after it (used when a stream aborts mid-turn).
+
+    This is a patch/snapshot log, not a plain append log: a message id can be
+    superseded or invalidated by a later record. Producing the *current*
+    state therefore needs one id->message map built by replaying every
+    record in order (matching the CLI's own loadConversationRecord), not a
+    flat per-line emission like the Claude/Codex adapters use. iter_events
+    still reads the file one line at a time (never loads it whole), but
+    withholds normalized events until end of file so the map reflects every
+    $set/$rewindTo it has seen; Gemini session files are chat text plus
+    capped tool output (MAX_TOOL_OUTPUT_SIZE = 50 KiB per call in the same
+    source), not the 30-100 MiB scale Claude/Codex sessions reach.
+
+    Compaction has no dedicated record type. A real compaction is recorded as
+    a synthetic "user" message whose text is a <state_snapshot>...</state_snapshot>
+    block, immediately followed by a fixed "gemini" acknowledgement reply
+    ("Got it. Thanks for the additional context!") - both come straight from
+    the compression prompt template in the same source file. Both are
+    detected and handled here; the acknowledgement is dropped as noise and
+    the snapshot becomes the compaction event.
+
+    A tool result can appear in two different shapes depending on whether the
+    message was ever touched by a history resync: inline in a "gemini"
+    message's own toolCalls[].result, or as a functionResponse Part inside a
+    *separate* later "user"-role message (the Gemini API's own tool-response
+    convention). Both are handled; the latter means a "user"-type record is
+    not automatically a human message and must be checked for functionResponse
+    parts first.
+
+    Caveat: tool-call, thought, token and compaction handling is verified
+    against the shipped source and a synthetic fixture built from it, not
+    against a real completed round trip - only the header record and one
+    plain user message were confirmed against genuine CLI output. Treat this
+    adapter as less battle-tested than the Claude and Codex ones until it has
+    been run against a real authenticated session.
+    """
+
+    agent = AGENT_GEMINI
+    label = "Gemini"
+
+    def root_dir(self) -> Path:
+        return self.home / ".gemini" / "tmp"
+
+    @staticmethod
+    def slugify(text: str) -> str:
+        """Mirrors ProjectRegistry.slugify() in projectRegistry.js exactly."""
+        slug = re.sub(r"[^a-z0-9]", "-", text.lower())
+        slug = re.sub(r"-+", "-", slug).strip("-")
+        return slug or "project"
+
+    def path_hint_matches(self, path: Path) -> bool:
+        slug_dir_name = path.parent.parent.name.lower()
+        expected = self.slugify(Path(self.repo_root).name)
+        # A numeric collision suffix ("-1", "-2", ...) is part of their
+        # scheme too; a prefix match still counts as a hint, just a weaker one.
+        return slug_dir_name == expected or slug_dir_name.startswith(expected + "-")
+
+    def candidate_files(self) -> List[Path]:
+        root = self.root_dir()
+        if not root.is_dir():
+            return []
+        files: List[Path] = []
+        try:
+            slug_dirs = [entry for entry in root.iterdir() if entry.is_dir()]
+        except OSError:
+            return []
+        for slug_dir in slug_dirs:
+            try:
+                # Top-level only: nested <slug>/chats/<parentId>/*.jsonl are
+                # subagent sessions belonging to a parent session.
+                files.extend(sorted(slug_dir.glob("chats/*.jsonl")))
+            except OSError:
+                continue
+        return files
+
+    @staticmethod
+    def session_id_from_path(path: Path) -> str:
+        match = _GEMINI_SESSION_ID_RE.search(path.name)
+        return match.group(1) if match else path.stem
+
+    def probe(self, path: Path, max_lines: int = 5, max_bytes: int = 64 * 1024) -> Tuple[Optional[str], Optional[str]]:
+        # cwd: the project-root marker sitting next to the chats/ directory
+        # this session lives under - the same file the CLI itself trusts
+        # (ProjectRegistry.verifySlugOwnership reads exactly this file).
+        cwd: Optional[str] = None
+        try:
+            marker = path.parent.parent / ".project_root"
+            cwd = marker.read_text(encoding="utf-8", errors="replace").strip() or None
+        except OSError:
+            pass
+
+        session_id: Optional[str] = None
+        read = 0
+        try:
+            with open(path, "r", encoding="utf-8", errors="replace") as handle:
+                for index, line in enumerate(handle):
+                    read += len(line)
+                    # Note: no handle.tell() here - Python disables tell() on a
+                    # text file once next()/iteration has been used on it.
+                    if index >= max_lines or read >= max_bytes:
+                        break
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        record = json.loads(line)
+                    except ValueError:
+                        continue
+                    if isinstance(record, dict) and isinstance(record.get("sessionId"), str):
+                        session_id = record["sessionId"]
+                        break
+        except OSError as exc:
+            log_verbose("cannot probe %s: %s" % (path, exc))
+        return session_id, cwd
+
+    # -- content helpers --------------------------------------------------
+
+    @staticmethod
+    def _as_parts(content: Any) -> List[Dict[str, Any]]:
+        """Mirrors ensurePartArray(): a bare string becomes one text part."""
+        if content is None:
+            return []
+        if isinstance(content, str):
+            return [{"text": content}] if content else []
+        if isinstance(content, list):
+            return [part if isinstance(part, dict) else {"text": str(part)} for part in content]
+        if isinstance(content, dict):
+            return [content]
+        return [{"text": str(content)}]
+
+    @staticmethod
+    def _flatten_text(parts: Sequence[Dict[str, Any]]) -> str:
+        """Visible text only: skips thoughts and non-text parts (getResponseText)."""
+        chunks = [str(part.get("text") or "") for part in parts
+                 if isinstance(part, dict) and part.get("text") and not part.get("thought")]
+        return "\n".join(chunk for chunk in chunks if chunk)
+
+    @staticmethod
+    def _describe_args(args: Any) -> str:
+        if not isinstance(args, dict) or not args:
+            return json.dumps(args, ensure_ascii=False)[:800] if args else ""
+        interesting = ("file_path", "path", "absolute_path", "old_path", "new_path",
+                      "old_string", "new_string", "command", "pattern", "query", "url")
+        parts = ["%s: %s" % (key, args[key]) for key in interesting
+                if isinstance(args.get(key), str) and args[key].strip()]
+        if parts:
+            return "\n".join(parts)
+        try:
+            return json.dumps(args, ensure_ascii=False)[:800]
+        except (TypeError, ValueError):
+            return ""
+
+    @staticmethod
+    def _paths_from_args(args: Any) -> List[str]:
+        if not isinstance(args, dict):
+            return []
+        paths = []
+        for key in ("file_path", "path", "absolute_path", "old_path", "new_path"):
+            value = args.get(key)
+            if isinstance(value, str) and value.strip():
+                paths.append(value.strip())
+        return paths
+
+    @staticmethod
+    def _flatten_tool_result(result: Any) -> str:
+        if result is None:
+            return ""
+        if isinstance(result, str):
+            return result
+        if isinstance(result, list):
+            return GeminiAdapter._flatten_text(GeminiAdapter._as_parts(result)) or \
+                json.dumps(result, ensure_ascii=False, default=str)[:2000]
+        if isinstance(result, dict):
+            output = result.get("output")
+            if isinstance(output, str):
+                return output
+            response = result.get("response")
+            if isinstance(response, dict) and isinstance(response.get("output"), str):
+                return response["output"]
+            try:
+                return json.dumps(result, ensure_ascii=False, default=str)[:2000]
+            except (TypeError, ValueError):
+                return str(result)
+        return str(result)
+
+    def _tool_mutates(self, name: str, args: Any) -> bool:
+        if is_mutating_tool(name):
+            return True
+        if str(name).lower() in _GEMINI_SHELL_TOOL_NAMES:
+            return looks_like_mutating_shell_text(self._describe_args(args))
+        return False
+
+    # -- parsing ------------------------------------------------------------
+
+    def iter_events(self, path: Path) -> Iterator[Tuple[Optional[NormalizedEvent], bool]]:
+        session_id = ""
+        messages: "Dict[str, Dict[str, Any]]" = {}
+        invalid_lines = 0
+
+        for record, ok in iter_jsonl(path):
+            if not ok or record is None:
+                invalid_lines += 1
+                continue
+
+            if isinstance(record.get("$rewindTo"), str):
+                rewind_id = record["$rewindTo"]
+                if rewind_id in messages:
+                    keep = []
+                    found = False
+                    for key in messages:
+                        if key == rewind_id:
+                            found = True
+                        if not found:
+                            keep.append(key)
+                    messages = {key: messages[key] for key in keep}
+                else:
+                    messages = {}
+                continue
+
+            update = record.get("$set")
+            if isinstance(update, dict):
+                new_messages = update.get("messages")
+                if isinstance(new_messages, list):
+                    messages = {}
+                    for item in new_messages:
+                        if isinstance(item, dict) and isinstance(item.get("id"), str):
+                            messages[item["id"]] = item
+                continue
+
+            if isinstance(record.get("sessionId"), str) and isinstance(record.get("projectHash"), str):
+                session_id = session_id or record["sessionId"]
+                inline_messages = record.get("messages")
+                if isinstance(inline_messages, list):
+                    for item in inline_messages:
+                        if isinstance(item, dict) and isinstance(item.get("id"), str):
+                            messages[item["id"]] = item
+                continue
+
+            if isinstance(record.get("id"), str):
+                messages[record["id"]] = record
+                continue
+            # Anything else is a record shape not documented anywhere I could
+            # verify: skipped rather than guessed at.
+
+        for message in messages.values():
+            for event in self._normalize_message(message, session_id):
+                yield event, True
+
+        for _ in range(invalid_lines):
+            yield None, False
+
+    def _normalize_message(self, record: Dict[str, Any], session_id: str) -> List[NormalizedEvent]:
+        msg_type = str(record.get("type") or "")
+        timestamp = ts_to_iso(record.get("timestamp"))
+        base = dict(agent=self.agent, session_id=session_id, timestamp=timestamp, raw_type=msg_type)
+
+        if msg_type in ("info", "warning"):
+            return []
+
+        if msg_type == "error":
+            text = self._flatten_text(self._as_parts(record.get("content")))
+            return [NormalizedEvent(kind=KIND_TOOL_ERROR, text=text, is_error=True, **base)]
+
+        if msg_type == "user":
+            return self._normalize_user_message(record, base)
+
+        if msg_type == "gemini":
+            return self._normalize_gemini_message(record, base)
+
+        return []
+
+    def _normalize_user_message(self, record: Dict[str, Any], base: Dict[str, Any]) -> List[NormalizedEvent]:
+        parts = self._as_parts(record.get("content"))
+        responses = [part for part in parts if isinstance(part.get("functionResponse"), dict)]
+        if responses:
+            events = []
+            for part in responses:
+                response = part["functionResponse"]
+                text = self._flatten_tool_result(response.get("response"))
+                events.append(NormalizedEvent(
+                    kind=KIND_TOOL_ERROR if looks_like_failed_output(text) else KIND_TOOL_RESULT,
+                    tool_name=response.get("name"), text=text,
+                    is_error=looks_like_failed_output(text), **base))
+            return events
+
+        text = self._flatten_text(parts)
+        trimmed = text.strip()
+        # Checked before the ignored/injected filters below: a <state_snapshot>
+        # is real compaction evidence, even though it is exactly the kind of
+        # "just one XML wrapper" text is_injected_context() would otherwise
+        # treat as harness noise and discard.
+        if trimmed.startswith("<state_snapshot>") or "<state_snapshot>" in trimmed[:64]:
+            return [NormalizedEvent(kind=KIND_COMPACTION, text=text, **base)]
+        if (not trimmed or trimmed.startswith("/") or trimmed.startswith("?")
+                or trimmed.startswith("<session_context>") or trimmed.startswith("<hook_context>")
+                or is_injected_context(text)):
+            return []  # matches isIgnoredUserContent(), plus the generic safety net
+        return [NormalizedEvent(kind=KIND_USER, role="user", text=text, **base)]
+
+    def _normalize_gemini_message(self, record: Dict[str, Any], base: Dict[str, Any]) -> List[NormalizedEvent]:
+        events: List[NormalizedEvent] = []
+        parts = self._as_parts(record.get("content"))
+
+        text = self._flatten_text(parts)
+        if text.strip() and text.strip() != _GEMINI_ACK_TEXT:
+            events.append(NormalizedEvent(kind=KIND_ASSISTANT, role="gemini", text=text, **base))
+
+        for part in parts:
+            call = part.get("functionCall")
+            if isinstance(call, dict):
+                name = str(call.get("name") or "")
+                args = call.get("args")
+                events.append(NormalizedEvent(
+                    kind=KIND_TOOL_CALL, tool_name=name, text=self._describe_args(args),
+                    file_paths=self._paths_from_args(args), mutating=self._tool_mutates(name, args),
+                    **base))
+
+        for call in record.get("toolCalls") or []:
+            if not isinstance(call, dict):
+                continue
+            name = str(call.get("name") or "")
+            args = call.get("args")
+            events.append(NormalizedEvent(
+                kind=KIND_TOOL_CALL, tool_name=name, text=self._describe_args(args),
+                file_paths=self._paths_from_args(args), mutating=self._tool_mutates(name, args),
+                **base))
+            if "result" in call and call["result"] is not None:
+                result_text = self._flatten_tool_result(call["result"])
+                events.append(NormalizedEvent(
+                    kind=KIND_TOOL_ERROR if looks_like_failed_output(result_text) else KIND_TOOL_RESULT,
+                    tool_name=name, text=result_text, is_error=looks_like_failed_output(result_text), **base))
+
+        # "thoughts" holds free-form reasoning: opaque and skipped, matching
+        # Claude's "thinking" blocks and Codex's "reasoning" records.
+        return events
+
+
 def get_adapter(agent: str, repo_root: Path, home: Optional[Path] = None) -> BaseAdapter:
     if agent == AGENT_CLAUDE:
         return ClaudeAdapter(repo_root, home)
     if agent == AGENT_CODEX:
         return CodexAdapter(repo_root, home)
+    if agent == AGENT_GEMINI:
+        return GeminiAdapter(repo_root, home)
     raise HandoffError("unknown agent '%s' (expected: %s)" % (agent, ", ".join(AGENTS)), EXIT_USAGE)
 
 

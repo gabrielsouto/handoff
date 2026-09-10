@@ -3,8 +3,8 @@
 Instructions for any AI coding agent working in this repository.
 
 This repository holds `tools/handoff.py`: a local, dependency-free tool that
-turns the JSONL transcripts Claude Code and Codex already write into a
-`HANDOFF.md` the other agent can resume from. See [docs/handoff.md](docs/handoff.md).
+turns the JSONL transcripts Claude Code, Codex and Gemini CLI already write
+into a `HANDOFF.md` the next agent can resume from. See [docs/handoff.md](docs/handoff.md).
 
 ## Ground rules for this project
 
