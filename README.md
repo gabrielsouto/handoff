@@ -67,9 +67,8 @@ handoff sozinha, em segundos, tudo na sua máquina.
 - **Leitura em streaming.** Uma sessão real de 112 MiB do Codex é processada
   em ~2,4 s, com pico de ~31 MiB de heap.
 - **Memória dos agentes é indexada, nunca ingerida.** O `HANDOFF.md` lista o
-  que existe (diretório de memória do Claude, SQLite do Codex, `CLAUDE.md`/
-  `GEMINI.md`) e o quão recente é, mas nunca lê o conteúdo — é interpretação
-  passada de outro agente, não evidência.
+  que existe e quão recente é, mas nunca lê o conteúdo — é interpretação
+  passada de outro agente, não evidência. ([detalhes](#memória-dos-agentes))
 
 ## Agentes suportados
 
@@ -233,9 +232,8 @@ Tudo isso fica local e fora do Git, via `.git/info/exclude`. O `HANDOFF.md`
 nunca carrega um diff inteiro: o próximo agente está no mesmo checkout e pode
 rodar `git diff`. O handoff é um mapa, não uma cópia.
 
-Uma seção **Agent Memory** também é sempre incluída, listando o que a
-ferramenta encontrou de memória de cada agente (existência e recência, nunca
-conteúdo) — veja [docs/handoff.md](docs/handoff.md#10-agent-memory).
+Uma seção **Agent Memory** também é sempre incluída — veja
+[Memória dos agentes](#memória-dos-agentes) abaixo.
 
 ## O LLM opcional
 
@@ -265,6 +263,40 @@ redigido.
 
 É defesa em profundidade, não garantia de DLP. Na primeira vez que apontar a
 ferramenta para um endpoint novo, leia o `.handoff/ai-input-preview.md`.
+
+## Memória dos agentes
+
+Claude Code, Codex e Gemini CLI guardam alguma forma de memória ao lado dos
+transcripts: o Claude tem um diretório `memory/` por projeto (arquivos de
+fato mais um índice `MEMORY.md`), o Codex mantém dois SQLite globais
+(`memories_1.sqlite`, `goals_1.sqlite`) e o Gemini pode carregar um
+`memoryScratchpad` dentro de uma sessão. Os arquivos de contexto na raiz do
+repo (`CLAUDE.md`, `GEMINI.md`) entram na mesma categoria.
+
+A ferramenta **indexa, não ingere.** A ordem de evidência (Git > transcript >
+interpretação) existe justamente para desconfiar disso: memória é a
+interpretação passada de um agente, congelada e desconectada do que a
+produziu, sem nenhum jeito aqui de saber se ainda vale. Então:
+
+- `doctor` e todo `HANDOFF.md` listam o que existe, onde, e quão recente é —
+  contagem de arquivos, tamanhos, datas, status de rastreado/não-rastreado no
+  Git;
+- nada disso é aberto, parseado ou misturado nas dez seções de análise;
+- os SQLite do Codex em particular nunca são abertos — o schema é interno e
+  não documentado, então é só presença e tamanho, via `stat()`.
+
+A única exceção deliberada é o `memoryScratchpad` do Gemini: ele já vive
+dentro do arquivo de sessão que a ferramenta parseia, é escopo de uma sessão
+só (não um store global entre projetos), e o código-fonte do próprio CLI
+rastreia um sinal explícito de obsolescência — qualquer mensagem ou rewind
+gravado depois do último save do scratchpad o marca como stale. Com base
+nisso, ele aparece como um evento rotulado no `conversation-tail.md` (marcado
+como "possibly stale" ou "fresh", e explicitamente como não-confirmado), o
+mesmo tratamento já dado aos resumos de compactação `<state_snapshot>`.
+
+Puxar o **conteúdo** da memória para dentro do handoff seria uma decisão
+separada e explicitamente opt-in — não existe nada assim aqui hoje. Detalhes
+em [docs/handoff.md](docs/handoff.md#10-agent-memory).
 
 ---
 
